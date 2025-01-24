@@ -1,0 +1,247 @@
+
+//filepath: src\main.cpp
+#include <Arduino.h>
+
+#include "./user.hpp"
+#include "./node/node.hpp"
+
+#define INP_PIN_SENDER 26
+#define INP_PIN_RECIEVER 25
+
+#define DEFAULT_SEND_DELAY 40
+
+Node node{
+    IS_SENDING ? INP_PIN_SENDER : INP_PIN_RECIEVER,
+    !IS_SENDING ? INP_PIN_SENDER : INP_PIN_RECIEVER,
+    DEFAULT_SEND_DELAY,
+};
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println(IS_SENDING ? "SENDER" : "RECEIVER"); // Corrected typo in "RECEIVER"
+    node.init();
+}
+
+long recievedIndex = 0;
+
+void loop()
+{
+#if IS_SENDING
+    node.sendString("trafficcar");
+#else
+    recievedIndex++;
+    String value = node.readString();
+    if (value == "")
+        Serial.println("ERROR: Invalid data received");
+    else
+        Serial.println(value);
+    Serial.println(recievedIndex);
+#endif
+}
+
+//filepath: src\node\node.hpp
+#pragma once
+
+#include <Arduino.h>
+
+// bytes
+#include "./read-byte.hpp"
+#include "./send-byte.hpp"
+
+// strings
+#include "./read-string.hpp"
+#include "./send-string.hpp"
+
+struct Node
+{
+    u_int8_t inpPin, outPin;
+    int sendDelay;
+
+    Node(u_int8_t _inpPin, u_int8_t _outPin, int _sendDelay)
+    {
+        inpPin = _inpPin;
+        outPin = _outPin;
+        sendDelay = _sendDelay;
+    }
+
+    void init()
+    {
+        pinMode(inpPin, INPUT);
+        pinMode(outPin, OUTPUT);
+    }
+
+    void sendByte(uint8_t value)
+    {
+        rawSendByte(value, outPin, sendDelay);
+    }
+
+    uint8_t readByte()
+    {
+        return rawReadByte(inpPin, sendDelay);
+    }
+
+    void sendString(String value)
+    {
+        rawSendString(value, outPin, sendDelay);
+    }
+
+    String readString()
+    {
+        return rawReadString(inpPin, sendDelay);
+    }
+};
+
+//filepath: src\node\read-byte.hpp
+#pragma once
+#include <Arduino.h>
+
+uint8_t rawReadByte(int pin, int delayTime)
+{
+    // Wait for the start signal (HIGH state)
+    while (digitalRead(pin) != HIGH)
+        ;
+
+    // Record the start time
+    unsigned long startTime = micros();
+
+    uint8_t value = 0;
+
+    // Read each bit
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        // Calculate the target time for this bit
+        unsigned long bitStartTime = startTime + ((i + 1.5) * delayTime);
+
+        // Wait for the correct time
+        while (micros() < bitStartTime)
+            ;
+
+        // Sample the bit
+        if (digitalRead(pin) == HIGH)
+        {
+            value |= (1 << i); // Set bit in LSB-first order
+        }
+    }
+
+    // Wait for the end of the transmission
+    while (digitalRead(pin) == HIGH)
+        ;
+
+    return value;
+}
+
+//filepath: src\node\read-string.hpp
+#pragma once
+
+#include <Arduino.h>
+
+#include "./read-byte.hpp"
+
+String rawReadString(int pin, int delayTime)
+{
+    uint8_t receivedHash = rawReadByte(pin, delayTime);
+    int length = (rawReadByte(pin, delayTime) << 8) + rawReadByte(pin, delayTime);
+
+    // basic hash for the length
+    uint8_t lengthHash = ((length >> 8) & 0x0F) ^ (length & 0x0F);
+
+    if (lengthHash != receivedHash)
+        return "";
+
+    char *string = new char[length];
+
+    uint8_t dataHash = 0;
+
+    for (uint8_t i = 0; i < length; i++)
+    {
+        uint8_t value = rawReadByte(pin, delayTime);
+        string[i] = value;
+        dataHash ^= value;
+    }
+
+    uint8_t receivedDataHash = rawReadByte(pin, delayTime);
+    if (dataHash != receivedDataHash)
+    {
+        delete[] string;
+        return "";
+    }
+
+    String result = String(string, length); // Convert to String
+    delete[] string;                        // Free memory
+    return result;
+}
+
+//filepath: src\node\send-byte.hpp
+#pragma once
+#include <Arduino.h>
+
+void rawSendByte(uint8_t value, int pin, int delayTime)
+{
+    // Send start signal
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(delayTime);
+
+    unsigned long startTime = micros() + delayTime;
+
+    // Send each bit (LSB-first)
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        bool bit = (value & (1 << i)) != 0; // Extract bit `i`
+        digitalWrite(pin, bit ? HIGH : LOW);
+
+        // Wait for the bit duration
+        unsigned long bitEndTime = startTime + (i * delayTime);
+        while (micros() < bitEndTime)
+            ;
+    }
+
+    // Send end signal
+    digitalWrite(pin, LOW);
+    delayMicroseconds(delayTime);
+}
+
+//filepath: src\node\send-string.hpp
+#pragma once
+
+#include <Arduino.h>
+#include "./send-byte.hpp"
+
+void rawSendString(String text, int pin, int delayTime)
+{
+    // Get the size of the text
+    int length = text.length();
+
+    // Generate a simple hash for the length
+    uint8_t lengthHash = ((length >> 8) & 0x0F) ^ (length & 0x0F);
+    rawSendByte(lengthHash, pin, delayTime);
+    delayMicroseconds(delayTime);
+
+    // Send the length of the string as two bytes
+    rawSendByte((length >> 8) & 0xFF, pin, delayTime); // Correct mask for high byte
+    delayMicroseconds(delayTime);
+    rawSendByte(length & 0xFF, pin, delayTime); // Correct mask for low byte
+    delayMicroseconds(delayTime);
+
+    // Initialize the data hash
+    uint8_t dataHash = 0;
+
+    // Send the data bytes
+    for (int i = 0; i < length; i++)
+    {
+        uint8_t value = (uint8_t)text[i];
+        dataHash ^= value; // Update the hash
+        rawSendByte(value, pin, delayTime);
+        delayMicroseconds(delayTime);
+    }
+
+    // Send the data hash
+    rawSendByte(dataHash, pin, delayTime);
+    delayMicroseconds(delayTime);
+}
+
+//filepath: src\user.hpp
+#pragma once
+// Don't edit this file
+#define IS_SENDING false
+
